@@ -11,7 +11,7 @@ from openai import OpenAI, OpenAIError, RateLimitError
 
 colorama_init(autoreset=True)
 
-HISTORY_FILE = os.path.expanduser("~/.deepseek_shell_history.json")
+HISTORY_FILE = os.path.expanduser("~/.shell_history.json")
 OPENAI_API_KEY = "[redacted]"
 MODEL_NAME = "gpt-4o-mini"
 TEMPERATURE = 0.2
