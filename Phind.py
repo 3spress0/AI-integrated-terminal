@@ -1,121 +1,151 @@
 #!/usr/bin/env python3
-import subprocess
+import argparse
 import sys
-import re
-import socket
-import os
 import json
-import time
-import requests
-from colorama import init as colorama_init, Fore, Style
+import browser_cookie3
+import cloudscraper
 
-colorama_init(autoreset=True)
+_PHIND_SEARCH_URL = "https://phind.com/api/web/search"
 
-HISTORY_FILE = os.path.expanduser("~/.shell_history.json")
-PHIND_API_KEY = "[redacted]"
-MODEL_NAME = "Phind-CodeLlama-34B-v2"
-TEMPERATURE = 0.2
-MAX_TOKENS = 500
-MAX_HISTORY_LENGTH = 10
-MAX_RETRIES = 3
-RETRY_DELAY = 60
 
-SYSTEM_PROMPT = (
-    "You are a terminal assistant running inside a secure sandbox environment. "
-    "You have full sudo privileges and are allowed to install packages. "
-    "Maintain memory up to recent messages. ALWAYS THINK step-by-step and output a bash command in a code block with sudo as needed. "
-    "After executing, review output and propose next command. Stop when you state 'TASK COMPLETE'."
-)
-
-def load_history():
+def load_phind_cookies():
+    """
+    Load all cookies for phind.com (and any related CF cookie) from your default browser.
+    Print which cookie names and domains were found so you can verify they exist.
+    """
     try:
-        with open(HISTORY_FILE, "r") as f:
-            history = json.load(f)
-    except (FileNotFoundError, json.JSONDecodeError):
-        history = []
-    if not history or history[0].get('role') != 'system':
-        history.insert(0, {"role": "system", "content": SYSTEM_PROMPT})
-    return history
-
-chat_history = load_history()
-
-def trim_history(history):
-    base = [history[0]]
-    return base + history[-MAX_HISTORY_LENGTH:]
-
-def preprocess_cmd(cmd):
-    for host in set(re.findall(r"\b([A-Za-z0-9._-]+\.[A-Za-z]{2,})\b", cmd)):
-        try:
-            ip = socket.gethostbyname(host)
-            cmd = cmd.replace(host, ip)
-        except:
-            pass
-    return cmd
-
-def execute_command_stream(cmd):
-    if cmd.startswith('ping ') and '-c' not in cmd and '-n' not in cmd:
-        cmd += ' -c 4'
-    cmd = preprocess_cmd(cmd)
-    print(Fore.GREEN + f"💻 Executing Command: {cmd}\n")
-    proc = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
-    lines = []
-    for line in proc.stdout:
-        print(Fore.WHITE + line, end='')
-        lines.append(line)
-    proc.wait()
-    return ''.join(lines).strip()
-
-def save_history(history):
-    try:
-        with open(HISTORY_FILE, 'w') as f:
-            json.dump(history, f, indent=2)
+        cj = browser_cookie3.load(domain_name="phind.com")
     except Exception as e:
-        print(Fore.RED + f"[ERROR] Failed to save history: {e}")
+        print("[ERROR] Failed to load browser cookies for phind.com:", e)
+        sys.exit(1)
 
-def chat_with_phind(messages):
-    url = "https://api.phind.com/agent/"
+    # Filter down to cookies whose domain ends with phind.com (or Cloudflare if it shows up that way)
+    phind_cookies = []
+    for cookie in cj:
+        dom = cookie.domain.lower()
+        if dom.endswith("phind.com") or "phind.com" in dom:
+            phind_cookies.append(cookie)
+
+    if not phind_cookies:
+        print("[ERROR] No cookies for phind.com were found. Exiting.")
+        sys.exit(1)
+
+    # Print a debug list of what cookie names and domains we loaded
+    print(">> Loaded the following cookies for phind.com (and subdomains):")
+    found_names = set()
+    for c in phind_cookies:
+        print(f"   • {c.name}  (domain = {c.domain})")
+        found_names.add(c.name)
+
+    # Check for expected names
+    required_names = {"cf_clearance", "__Secure-next-auth.session-token"}
+    missing = required_names - found_names
+    if missing:
+        print(f"[WARNING] You appear to be missing {missing}.")
+        print("  → Make sure you are logged into phind.com in your browser and try again.")
+    return cj
+
+
+def phind_query(prompt: str, cookie_jar):
+    """
+    Send a POST to Phind’s “web search” endpoint (via cloudscraper),
+    using the browser cookies we just loaded. Return parsed JSON.
+    """
+    scraper = cloudscraper.create_scraper(
+        browser={"browser": "chrome", "platform": "windows", "mobile": False}
+    )
+    scraper.cookies = cookie_jar
+
     headers = {
-        "Content-Type": "application/json",
-        "Authorization": f"Bearer {PHIND_API_KEY}",
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/114.0.0.0 Safari/537.36"
+        ),
+        "Accept": "application/json, text/plain, */*",
+        "Content-Type": "application/json;charset=UTF-8",
+        "Origin": "https://phind.com",
+        "Referer": "https://phind.com/",
     }
-    payload = {
-        "messages": messages,
-        "model": MODEL_NAME,
-        "temperature": TEMPERATURE,
-        "max_tokens": MAX_TOKENS,
-    }
-    for attempt in range(1, MAX_RETRIES + 1):
-        try:
-            response = requests.post(url, json=payload, headers=headers)
-            response.raise_for_status()
-            reply = response.json().get("choices", [{}])[0].get("message", {}).get("content", "").strip()
-            return reply
-        except requests.exceptions.RequestException as e:
-            print(Fore.RED + f"[ERROR] Phind API error: {e}")
-            break
-    return "TASK COMPLETE"
 
-def extract_command(text):
-    m = re.search(r"```bash\s*(.*?)\s*```", text, re.DOTALL)
-    block = m.group(1) if m else text
-    parts = [l.strip().lstrip('$').strip() for l in block.splitlines() if l.strip()]
-    return ' && '.join(parts)
+    payload = {"q": prompt}
+
+    resp = scraper.post(_PHIND_SEARCH_URL, json=payload, headers=headers)
+    try:
+        resp.raise_for_status()
+    except Exception as e:
+        print(f"[ERROR] HTTP error while querying Phind: {e}  (status {resp.status_code})")
+        print("[ERROR] Response body:")
+        print(resp.text)
+        sys.exit(1)
+
+    try:
+        return resp.json()
+    except Exception:
+        print("[ERROR] Response was not valid JSON. Raw response below:")
+        print(resp.text)
+        sys.exit(1)
+
+
+def extract_answer(json_data: dict):
+    """
+    Try a few common patterns to pull out a human-readable answer string from Phind’s JSON.
+    Return None if nothing matches.
+    """
+    if not isinstance(json_data, dict):
+        return None
+
+    # Pattern 1: top-level "answer"
+    ans = json_data.get("answer")
+    if isinstance(ans, str):
+        return ans
+
+    # Pattern 2: "data" -> "answer"
+    data = json_data.get("data", {})
+    if isinstance(data, dict):
+        ans2 = data.get("answer")
+        if isinstance(ans2, str):
+            return ans2
+
+    # Pattern 3: "messages" -> list of {role, text}
+    messages = json_data.get("messages")
+    if isinstance(messages, list):
+        for m in messages:
+            if m.get("role") == "assistant" and isinstance(m.get("text"), str):
+                return m["text"]
+
+    return None
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description=(
+            "Standalone Phind CLI (no manual cookies). "
+            "You must be logged into phind.com in your browser."
+        )
+    )
+    parser.add_argument(
+        "--prompt", required=True,
+        help="The question or prompt to send to Phind."
+    )
+    args = parser.parse_args()
+
+    cookie_jar = load_phind_cookies()
+    print()
+    print(">> Querying Phind for:", args.prompt)
+    print()
+
+    result = phind_query(args.prompt, cookie_jar)
+
+    answer = extract_answer(result)
+    if answer:
+        print(">> Phind’s Answer:\n")
+        print(answer.strip())
+    else:
+        print(">> Could not locate an “answer” field in Phind’s JSON response.")
+        print(">> Full JSON follows:\n")
+        print(json.dumps(result, indent=2))
+
 
 if __name__ == "__main__":
-    if len(sys.argv) < 2:
-        print(Fore.RED + "Usage: python3 Ai.py \"task description\"")
-        sys.exit(1)
-    task = " ".join(sys.argv[1:])
-    print(Fore.BLUE + f"🎯 Task: {task}\n")
-    user_msg = task
-    while True:
-        llm = chat_with_phind([{"role": "user", "content": user_msg + "\nProvide next bash command in a code block."}])
-        print(Fore.MAGENTA + "🧠 LLM Response:\n" + llm + "\n")
-        cmd = extract_command(llm)
-        out = execute_command_stream(cmd)
-        user_msg = f"Command: {cmd}\nOutput:\n{out}"
-        follow = chat_with_phind([{"role": "user", "content": user_msg + "\nProvide next bash command or 'TASK COMPLETE'."}])
-        print(Fore.MAGENTA + "🤖 Follow-Up:\n" + follow + "\n")
-        if re.search(r"TASK COMPLETE", follow, re.IGNORECASE):
-            print(Fore.GREEN + "✅ Task complete.")
-            break
+    main()
