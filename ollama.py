@@ -7,21 +7,21 @@ import os
 import json
 import time
 from colorama import init as colorama_init, Fore, Style
+import requests
 
 colorama_init(autoreset=True)
 
 HISTORY_FILE = os.path.expanduser("~/.shell_history.json")
-MODELS = ["codellama", "phi3", "llama3"]  # Local models via Ollama
+MODELS = ["codellama:latest"]  # Use Codellama latest tag
 
 TEMPERATURE = 0.2
-MAX_HISTORY_LENGTH = 5
-RETRY_DELAY = 2  # seconds to wait before switching to next model
+MAX_HISTORY_LENGTH = 2
+RETRY_DELAY = 2  # seconds before exiting if model fails
+OLLAMA_API_URL = "http://localhost:11434/api/chat"
 
 SYSTEM_PROMPT = (
-    "You are a terminal assistant running inside a secure sandbox environment. "
-    "You have full sudo privileges and are allowed to install packages. "
-    "Maintain memory up to recent messages. ALWAYS THINK step-by-step and output a bash command in a code block with sudo as needed. "
-    "After executing, review output and propose next command. Stop when you state 'TASK COMPLETE'."
+    "You are a sandboxed terminal assistant. "
+    "Always think step-by-step, respond with a bash command in a code block, and finish with 'TASK COMPLETE'."
 )
 
 def load_history():
@@ -41,7 +41,6 @@ def save_history(history):
         print(Fore.RED + f"[ERROR] Failed to save history: {e}")
 
 def trim_history(history):
-    # Keep system prompt + last MAX_HISTORY_LENGTH user/assistant pairs
     base = [history[0]]
     filtered = [msg for msg in history[1:] if msg["role"] in ("user", "assistant")]
     return base + filtered[-(MAX_HISTORY_LENGTH * 2):]
@@ -57,7 +56,6 @@ def preprocess_cmd(cmd):
     return cmd
 
 def execute_command_stream(cmd):
-    # If it's a ping without -c or -n, add "-c 4"
     if cmd.startswith("ping ") and "-c" not in cmd and "-n" not in cmd:
         cmd += " -c 4"
     cmd = preprocess_cmd(cmd)
@@ -71,25 +69,38 @@ def execute_command_stream(cmd):
     return "".join(lines).strip()
 
 def call_ollama(messages, model_id):
-    # Build a single prompt string from the chat history
-    prompt = "\n".join(f"{m['role']}: {m['content']}" for m in messages)
+    payload = {
+        "model": model_id,
+        "stream": False,
+        "messages": messages
+    }
     try:
-        result = subprocess.run(
-            ["ollama", "run", model_id],
-            input=prompt,
-            text=True,
-            capture_output=True,
-            timeout=120
-        )
-        return result.stdout.strip(), None
-    except subprocess.TimeoutExpired:
-        return None, "timeout"
+        resp = requests.post(OLLAMA_API_URL, json=payload, timeout=60)
     except Exception as e:
-        return None, f"error: {e}"
+        return None, f"network_error: {e}"
+
+    if resp.status_code != 200:
+        return None, f"error_{resp.status_code}: {resp.text}"
+
+    try:
+        data = resp.json()
+    except Exception as e:
+        return None, f"invalid_json: {e}"
+
+    content = data.get("message", {}).get("content", "").strip()
+    if not content:
+        return None, "empty_response"
+    return content, None
 
 def chat_with_llm(message, history, model_id):
     history.append({"role": "user", "content": message})
     trimmed = trim_history(history)
+
+    prompt_text = "\n".join(f"{m['role']}: {m['content']}" for m in trimmed)
+    if len(prompt_text.split()) > 3800:
+        # Drop oldest user/assistant pair if still too long
+        trimmed = trimmed[:1] + trimmed[-(MAX_HISTORY_LENGTH * 2 - 1):]
+
     result, err = call_ollama(trimmed, model_id)
     if result:
         history.append({"role": "assistant", "content": result})
@@ -116,13 +127,12 @@ def main():
 
     while True:
         if model_index >= len(MODELS):
-            print(Fore.RED + "[ERROR] All local models failed.")
+            print(Fore.RED + "[ERROR] Codellama failed.")
             sys.exit(1)
 
         model_id = MODELS[model_index]
-        print(Fore.CYAN + f"[INFO] Trying model: {model_id}")
+        print(Fore.CYAN + f"[INFO] Using model: {model_id}")
 
-        # 1) Ask for next bash command
         llm_response, error = chat_with_llm(
             user_msg + "\nProvide next bash command in a code block.",
             chat_history,
@@ -130,17 +140,14 @@ def main():
         )
 
         if error:
-            print(Fore.YELLOW + f"[WARN] Model error: {error}. Trying next model...\n")
-            model_index += 1
-            time.sleep(RETRY_DELAY)
-            continue
+            print(Fore.YELLOW + f"[WARN] Model error: {error}. Exiting.\n")
+            sys.exit(1)
 
         print(Fore.MAGENTA + "🧠 LLM Response:\n" + llm_response + "\n")
         cmd = extract_command(llm_response)
         out = execute_command_stream(cmd)
         user_msg = f"Command: {cmd}\nOutput:\n{out}"
 
-        # 2) Ask for follow‑up (next command or TASK COMPLETE)
         follow_up, error2 = chat_with_llm(
             user_msg + "\nProvide next bash command or 'TASK COMPLETE'.",
             chat_history,
@@ -148,10 +155,8 @@ def main():
         )
 
         if error2:
-            print(Fore.YELLOW + f"[WARN] Model error during follow-up: {error2}. Trying next model...\n")
-            model_index += 1
-            time.sleep(RETRY_DELAY)
-            continue
+            print(Fore.YELLOW + f"[WARN] Model error during follow-up: {error2}. Exiting.\n")
+            sys.exit(1)
 
         print(Fore.MAGENTA + "🤖 Follow-Up:\n" + follow_up + "\n")
         if re.search(r"TASK COMPLETE", follow_up, re.IGNORECASE):
